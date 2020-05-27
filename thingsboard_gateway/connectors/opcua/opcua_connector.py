@@ -157,9 +157,9 @@ class OpcUaConnector(Thread, Connector):
         try:
             node = self.client.get_root_node()
             node.get_children()
-            self.__connected = True
-            if not self.__server_conf.get("disableSubscriptions", False):
+            if not self.__server_conf.get("disableSubscriptions", False) and (not self.__connected or not self.subscribed):
                 self.__sub = self.client.create_subscription(self.__server_conf.get("subCheckPeriodInMillis", 500), self.__sub_handler)
+            self.__connected = True
         except ConnectionRefusedError:
             self.__connected = False
             self._subscribed = {}
@@ -205,7 +205,10 @@ class OpcUaConnector(Thread, Connector):
                 for attribute in content["data"]:
                     for variable in server_variables:
                         if attribute == variable:
-                            server_variables[variable].set_value(content["data"][variable])
+                            try:
+                                server_variables[variable].set_value(content["data"][variable])
+                            except Exception:
+                                server_variables[variable].set_attribute(ua.AttributeIds.Value, ua.DataValue(content["data"][variable]))
         except Exception as e:
             log.exception(e)
 

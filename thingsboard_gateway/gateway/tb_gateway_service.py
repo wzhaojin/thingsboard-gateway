@@ -12,9 +12,8 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
-from sys import getsizeof, executable, argv, stdout
+from sys import getsizeof, executable, argv
 from os import listdir, path, execv, pathsep, system
-from pkg_resources import get_distribution
 from time import time, sleep
 import logging
 import logging.config
@@ -35,6 +34,7 @@ except ImportError:
     TBUtility.install_package("pyrsistent")
 
 from thingsboard_gateway.gateway.tb_client import TBClient
+from thingsboard_gateway.gateway.tb_updater import TBUpdater
 from thingsboard_gateway.gateway.tb_logger import TBLoggerHandler
 from thingsboard_gateway.storage.memory_event_storage import MemoryEventStorage
 from thingsboard_gateway.storage.file_event_storage import FileEventStorage
@@ -48,6 +48,7 @@ main_handler = logging.handlers.MemoryHandler(-1)
 
 class TBGatewayService:
     def __init__(self, config_file=None):
+        self.stopped = False
         self.__lock = RLock()
         if config_file is None:
             config_file = path.dirname(path.dirname(path.abspath(__file__))) + '/config/tb_gateway.yaml'.replace('/', path.sep)
@@ -62,8 +63,11 @@ class TBGatewayService:
         global log
         log = logging.getLogger('service')
         log.info("Gateway starting...")
-        self.version = get_distribution('thingsboard_gateway').version
-        log.info("ThingsBoard IoT gateway version: %s", self.version)
+        self.__updater = TBUpdater()
+        self.__updates_check_period_ms = 300000
+        self.__updates_check_time = 0
+        self.version = self.__updater.get_version()
+        log.info("ThingsBoard IoT gateway version: %s", self.version["current_version"])
         self.available_connectors = {}
         self.__connector_incoming_messages = {}
         self.__connected_devices = {}
@@ -103,6 +107,7 @@ class TBGatewayService:
             "ping": self.__rpc_ping,
             "stats": self.__form_statistics,
             "devices": self.__rpc_devices,
+            "update": self.__rpc_update,
         }
         self.__sheduled_rpc_calls = []
         self.__self_rpc_sheduled_methods_functions = {
@@ -131,7 +136,7 @@ class TBGatewayService:
 
         try:
             gateway_statistic_send = 0
-            while True:
+            while not self.stopped:
                 cur_time = time()*1000
                 if self.__sheduled_rpc_calls:
                     for rpc_call_index in range(len(self.__sheduled_rpc_calls)):
@@ -169,11 +174,12 @@ class TBGatewayService:
                     self.tb_client.client.send_telemetry(summary_messages)
                     gateway_statistic_send = time()*1000
                     # self.__check_shared_attributes()
+
+                if cur_time - self.__updates_check_time >= self.__updates_check_period_ms:
+                    self.__updates_check_time = time()*1000
+                    self.version = self.__updater.get_version()
         except KeyboardInterrupt:
-            log.info("Stopping...")
-            self.__close_connectors()
-            log.info("The gateway has been stopped.")
-            self.tb_client.stop()
+            self.__stop_gateway()
         except Exception as e:
             log.exception(e)
             self.__close_connectors()
@@ -189,7 +195,12 @@ class TBGatewayService:
                 log.exception(e)
 
     def __stop_gateway(self):
-        pass
+        self.stopped = True
+        self.__updater.stop()
+        log.info("Stopping...")
+        self.__close_connectors()
+        log.info("The gateway has been stopped.")
+        self.tb_client.stop()
 
     def _attributes_parse(self, content, *args):
         try:
@@ -467,7 +478,7 @@ class TBGatewayService:
             log.info("Gateway %s sheduled in %i seconds", method_to_call, seconds_to_restart/1000)
             result = {"success": True}
         elif arguments is not None:
-            result = self.__gateway_rpc_methods[method_to_call]()
+            result = self.__gateway_rpc_methods[method_to_call](arguments)
         else:
             result = self.__gateway_rpc_methods[method_to_call]()
         log.debug(result)
@@ -482,6 +493,17 @@ class TBGatewayService:
             if self.__connected_devices[device]["connector"] is not None:
                 data_to_send[device] = self.__connected_devices[device]["connector"].get_name()
         return {"code": 200, "resp": data_to_send}
+
+    def __rpc_update(self, *args):
+        try:
+            result = {"resp": self.__updater.update(),
+                      "code": 200,
+                      }
+        except Exception as e:
+            result = {"error": str(e),
+                      "code": 500
+                      }
+        return result
 
     def rpc_with_reply_processing(self, topic, content):
         req_id = self.__rpc_requests_in_progress[topic][0]["data"]["id"]

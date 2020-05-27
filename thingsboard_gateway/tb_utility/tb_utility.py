@@ -17,7 +17,7 @@ from os import path, listdir
 from inspect import getmembers, isclass
 from importlib import util
 from logging import getLogger
-from simplejson import dumps, loads
+from simplejson import dumps, loads, JSONDecodeError
 from jsonpath_rw import parse
 
 
@@ -33,7 +33,16 @@ class TBUtility:
 
     @staticmethod
     def decode(message):
-        content = loads(message.payload.decode("utf-8"))
+        try:
+            if isinstance(message.payload, bytes):
+                content = loads(message.payload.decode("utf-8"))
+            else:
+                content = loads(message.payload)
+        except JSONDecodeError:
+            if isinstance(message.payload, bytes):
+                content = message.payload.decode("utf-8")
+            else:
+                content = message.payload
         return content
 
     @staticmethod
@@ -145,7 +154,16 @@ class TBUtility:
     def install_package(package, version="upgrade"):
         from sys import executable
         from subprocess import check_call
+        result = False
         if version.lower() == "upgrade":
-            check_call([executable, "-m", "pip", "install", package, "--upgrade", "--user"])
+            result = check_call([executable, "-m", "pip", "install", package, "--upgrade", "--user"])
         else:
-            check_call([executable, "-m", "pip", "install", package + version, "--user"])
+            from pkg_resources import get_distribution
+            current_package_version = None
+            try:
+                current_package_version = get_distribution(package)
+            except Exception:
+                pass
+            if current_package_version is None or current_package_version != version:
+                result = check_call([executable, "-m", "pip", "install", package + "==" + version, "--user"])
+        return result
