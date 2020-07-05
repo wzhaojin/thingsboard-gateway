@@ -12,7 +12,7 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
-import json
+import simplejson
 import time
 import string
 import random
@@ -137,18 +137,18 @@ class MqttConnector(Connector, Thread):
                         # Will report all missing fields to user before discarding the entry => no break here
                         discard = True
                         self.__log.error("Mandatory key '%s' missing from %s handler: %s",
-                                         key, handler_flavor, json.dumps(handler))
+                                         key, handler_flavor, simplejson.dumps(handler))
                     else:
                         self.__log.debug("Mandatory key '%s' found in %s handler: %s",
-                                         key, handler_flavor, json.dumps(handler))
+                                         key, handler_flavor, simplejson.dumps(handler))
 
                 if discard:
                     self.__log.error("%s handler is missing some mandatory keys => rejected: %s",
-                                     handler_flavor, json.dumps(handler))
+                                     handler_flavor, simplejson.dumps(handler))
                 else:
                     accepted_handlers_list.append(handler)
                     self.__log.debug("%s handler has all mandatory keys => accepted: %s",
-                                     handler_flavor, json.dumps(handler))
+                                     handler_flavor, simplejson.dumps(handler))
 
             self.__log.info("Number of accepted %s handlers: %d",
                             handler_flavor,
@@ -167,17 +167,7 @@ class MqttConnector(Connector, Thread):
 
     def run(self):
         try:
-            while not self._connected and not self.__stopped:
-                try:
-                    self._client.connect(self.__broker['host'],
-                                         self.__broker.get('port', 1883))
-                    self._client.loop_start()
-                    if not self._connected:
-                        time.sleep(1)
-                except ConnectionRefusedError as e:
-                    self.__log.exception(e)
-                    time.sleep(10)
-
+            self.__connect()
         except Exception as e:
             self.__log.exception(e)
             try:
@@ -187,7 +177,21 @@ class MqttConnector(Connector, Thread):
         while True:
             if self.__stopped:
                 break
+            elif not self._connected:
+                self.__connect()
             time.sleep(.01)
+
+    def __connect(self):
+        while not self._connected and not self.__stopped:
+            try:
+                self._client.connect(self.__broker['host'],
+                                     self.__broker.get('port', 1883))
+                self._client.loop_start()
+                if not self._connected:
+                    time.sleep(1)
+            except ConnectionRefusedError as e:
+                self.__log.error(e)
+                time.sleep(10)
 
     def close(self):
         self.__stopped = True
@@ -295,6 +299,7 @@ class MqttConnector(Connector, Thread):
                 self.__log.error("%s connection FAIL with unknown error!", self.get_name())
 
     def _on_disconnect(self, *args):
+        self._connected = False
         self.__log.debug('"%s" was disconnected. %s', self.get_name(), str(args))
 
     def _on_log(self, *args):
@@ -333,15 +338,18 @@ class MqttConnector(Connector, Thread):
             for topic in topic_handlers:
                 available_converters = self.__mapping_sub_topics[topic]
                 for converter in available_converters:
-                    converted_content = converter.convert(message.topic, content)
+                    try:
+                        converted_content = converter.convert(message.topic, content)
 
-                    if converted_content:
-                        request_handled = True
-                        self.__gateway.send_to_storage(self.name, converted_content)
-                        self.statistics['MessagesSent'] += 1
-                        self.__log.debug("Successfully converted message from topic %s", message.topic)
-                    else:
-                        continue
+                        if converted_content:
+                            request_handled = True
+                            self.__gateway.send_to_storage(self.name, converted_content)
+                            self.statistics['MessagesSent'] += 1
+                            self.__log.debug("Successfully converted message from topic %s", message.topic)
+                        else:
+                            continue
+                    except Exception as e:
+                        log.exception(e)
 
             if not request_handled:
                 self.__log.error('Cannot find converter for the topic:"%s"! Client: %s, User data: %s',
@@ -374,8 +382,7 @@ class MqttConnector(Connector, Thread):
                 # Get device type (if any), either from topic or from content
                 if handler.get("deviceTypeTopicExpression"):
                     device_type_match = search(handler["deviceTypeTopicExpression"], message.topic)
-                    if device_type_match is not None:
-                        found_device_type = device_type_match.group(0)
+                    found_device_type = device_type_match.group(0) if device_type_match is not None else handler["deviceTypeTopicExpression"]
                 elif handler.get("deviceTypeJsonExpression"):
                     found_device_type = TBUtility.get_value(handler["deviceTypeJsonExpression"], content)
 
@@ -552,7 +559,7 @@ class MqttConnector(Connector, Thread):
                         .replace("${deviceName}", content["device"]) \
                         .replace("${methodName}", content["data"]["method"]) \
                         .replace("${requestId}", str(content["data"]["id"])) \
-                        .replace("${params}", content["data"]["params"])
+                        .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
                     if rpc_config.get("responseTimeout"):
                         timeout = time.time()*1000+rpc_config.get("responseTimeout")
                         self.__gateway.register_rpc_request_timeout(content,
@@ -570,12 +577,12 @@ class MqttConnector(Connector, Thread):
                         .replace("${deviceName}", content["device"])\
                         .replace("${methodName}", content["data"]["method"])\
                         .replace("${requestId}", str(content["data"]["id"]))\
-                        .replace("${params}", content["data"]["params"])
+                        .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
                     data_to_send = rpc_config.get("valueExpression")\
                         .replace("${deviceName}", content["device"])\
                         .replace("${methodName}", content["data"]["method"])\
                         .replace("${requestId}", str(content["data"]["id"]))\
-                        .replace("${params}", content["data"]["params"])
+                        .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
                     try:
                         self._client.publish(topic, data_to_send)
                         self.__log.debug("Send RPC with no response request to topic: %s with data %s",

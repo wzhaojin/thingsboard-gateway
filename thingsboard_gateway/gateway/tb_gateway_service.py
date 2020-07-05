@@ -45,6 +45,17 @@ from thingsboard_gateway.gateway.tb_gateway_remote_configurator import RemoteCon
 log = logging.getLogger('service')
 main_handler = logging.handlers.MemoryHandler(-1)
 
+DEFAULT_CONNECTORS = {
+            "mqtt": "MqttConnector",
+            "modbus": "ModbusConnector",
+            "opcua": "OpcUaConnector",
+            "ble": "BLEConnector",
+            "request": "RequestConnector",
+            "can": "CanConnector",
+            "bacnet": "BACnetConnector",
+            "odbc": "OdbcConnector",
+            "rest": "RESTConnector",
+        }
 
 class TBGatewayService:
     def __init__(self, config_file=None):
@@ -74,11 +85,13 @@ class TBGatewayService:
         self.__saved_devices = {}
         self.__events = []
         self.name = ''.join(choice(ascii_lowercase) for _ in range(64))
+        self.__rpc_register_queue = Queue(-1)
         self.__rpc_requests_in_progress = {}
         self.__connected_devices_file = "connected_devices.json"
         self.tb_client = TBClient(config["thingsboard"])
         self.tb_client.connect()
         self.subscribe_to_required_topics()
+        self.__subscribed_to_rpc_topics = True
         if logging_error is not None:
             self.tb_client.client.send_telemetry({"ts": time()*1000, "values": {"LOGS": "Logging loading exception, logs.conf is wrong: %s" % (str(logging_error), )}})
             TBLoggerHandler.set_default_handler()
@@ -88,16 +101,7 @@ class TBGatewayService:
         self.main_handler = main_handler
         self.remote_handler = TBLoggerHandler(self)
         self.main_handler.setTarget(self.remote_handler)
-        self._default_connectors = {
-            "mqtt": "MqttConnector",
-            "modbus": "ModbusConnector",
-            "opcua": "OpcUaConnector",
-            "ble": "BLEConnector",
-            "request": "RequestConnector",
-            "can": "CanConnector",
-            "bacnet": "BACnetConnector",
-            "odbc": "OdbcConnector"
-        }
+        self._default_connectors = DEFAULT_CONNECTORS
         self._implemented_connectors = {}
         self._event_storage_types = {
             "memory": MemoryEventStorage,
@@ -138,6 +142,13 @@ class TBGatewayService:
             gateway_statistic_send = 0
             while not self.stopped:
                 cur_time = time()*1000
+                if not self.tb_client.is_connected() and self.__subscribed_to_rpc_topics:
+                    self.__subscribed_to_rpc_topics = False
+                if self.tb_client.is_connected() and not self.__subscribed_to_rpc_topics:
+                    for device in self.__saved_devices:
+                        self.add_device(device, {"connector": self.__saved_devices[device]["connector"]}, True, device_type=self.__saved_devices[device]["device_type"])
+                    self.subscribe_to_required_topics()
+                    self.__subscribed_to_rpc_topics = True
                 if self.__sheduled_rpc_calls:
                     for rpc_call_index in range(len(self.__sheduled_rpc_calls)):
                         rpc_call = self.__sheduled_rpc_calls[rpc_call_index]
@@ -150,13 +161,20 @@ class TBGatewayService:
                                 log.exception(e)
                             if result == 256:
                                 log.warning("Error on RPC command: 256. Permission denied.")
-                if self.__rpc_requests_in_progress and self.tb_client.is_connected():
-                    for rpc_in_progress, data in self.__rpc_requests_in_progress.items():
-                        if cur_time >= data[1]:
-                            data[2](rpc_in_progress)
-                            self.cancel_rpc_request(rpc_in_progress)
-                            self.__rpc_requests_in_progress[rpc_in_progress] = "del"
-                    new_rpc_request_in_progress = {key: value for key, value in self.__rpc_requests_in_progress.items() if value != 'del'}
+                if (self.__rpc_requests_in_progress or not self.__rpc_register_queue.empty()) and self.tb_client.is_connected():
+                    new_rpc_request_in_progress = {}
+                    if self.__rpc_requests_in_progress:
+                        for rpc_in_progress, data in self.__rpc_requests_in_progress.items():
+                            if cur_time >= data[1]:
+                                data[2](rpc_in_progress)
+                                self.cancel_rpc_request(rpc_in_progress)
+                                self.__rpc_requests_in_progress[rpc_in_progress] = "del"
+                        new_rpc_request_in_progress = {key: value for key, value in self.__rpc_requests_in_progress.items() if value != 'del'}
+                    if not self.__rpc_register_queue.empty():
+                        rpc_request_from_queue = self.__rpc_register_queue.get(False)
+                        topic = rpc_request_from_queue["topic"]
+                        data = rpc_request_from_queue["data"]
+                        new_rpc_request_in_progress[topic] = data
                     self.__rpc_requests_in_progress = new_rpc_request_in_progress
                 else:
                     try:
@@ -531,7 +549,8 @@ class TBGatewayService:
             log.exception(e)
 
     def register_rpc_request_timeout(self, content, timeout, topic, cancel_method):
-        self.__rpc_requests_in_progress[topic] = (content, timeout, cancel_method)
+        self.__rpc_register_queue.put({"topic": topic, "data": (content, timeout, cancel_method)}, False)
+        # self.__rpc_requests_in_progress[topic] = (content, timeout, cancel_method)
 
     def cancel_rpc_request(self, rpc_request):
         content = self.__rpc_requests_in_progress[rpc_request][0]
@@ -568,14 +587,14 @@ class TBGatewayService:
 
     def add_device(self, device_name, content, wait_for_publish=False, device_type=None):
         if device_name not in self.__saved_devices:
-            self.__connected_devices[device_name] = content
-            self.__saved_devices[device_name] = content
             device_type = device_type if device_type is not None else 'default'
-            if wait_for_publish:
-                self.tb_client.client.gw_connect_device(device_name, device_type).wait_for_publish()
-            else:
-                self.tb_client.client.gw_connect_device(device_name, device_type)
+            self.__connected_devices[device_name] = {**content, "device_type": device_type}
+            self.__saved_devices[device_name] = {**content, "device_type": device_type}
             self.__save_persistent_devices()
+        if wait_for_publish:
+            self.tb_client.client.gw_connect_device(device_name, device_type).wait_for_publish()
+        else:
+            self.tb_client.client.gw_connect_device(device_name, device_type)
 
     def update_device(self, device_name, event, content):
         if event == 'connector' and self.__connected_devices[device_name].get(event) != content:

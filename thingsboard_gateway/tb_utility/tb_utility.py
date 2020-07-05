@@ -35,12 +35,12 @@ class TBUtility:
     def decode(message):
         try:
             if isinstance(message.payload, bytes):
-                content = loads(message.payload.decode("utf-8"))
+                content = loads(message.payload.decode("utf-8", "ignore"))
             else:
                 content = loads(message.payload)
         except JSONDecodeError:
             if isinstance(message.payload, bytes):
-                content = message.payload.decode("utf-8")
+                content = message.payload.decode("utf-8", "ignore")
             else:
                 content = message.payload
         return content
@@ -165,5 +165,6 @@ class TBUtility:
             except Exception:
                 pass
             if current_package_version is None or current_package_version != version:
-                result = check_call([executable, "-m", "pip", "install", package + "==" + version, "--user"])
+                installation_sign = "==" if ">=" not in version else ""
+                result = check_call([executable, "-m", "pip", "install", package + installation_sign + version, "--user"])
         return result
